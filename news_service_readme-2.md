@@ -547,19 +547,5 @@ docker run -d -p 5000:5000 \
 - [ ] 整合資料庫儲存歷史記錄
 - [ ] 支援多語言翻譯
 
-## 🤝 貢獻
-
-歡迎提交 Pull Request 或開 Issue！
-
-## 📄 授權
-
-MIT License
-
-## 📧 聯絡方式
-
-- Email: your-email@example.com
-- GitHub: [@yourusername](https://github.com/yourusername)
-
----
 
 **Made with ❤️ for Taiwan News Community**
