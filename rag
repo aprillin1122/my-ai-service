@@ -1,0 +1,565 @@
+"""
+新聞搜尋與分析 AI Service - Streamlit + RAG + Ollama 版本
+
+功能特色:
+1. 本地 LLM (Ollama) - 免費、離線可用
+2. RAG 向量檢索 - 智能問答
+3. 新聞知識庫 - 持久化存儲
+4. 混合模式 - 支援 OpenAI + Ollama
+
+安裝:
+pip install streamlit ollama chromadb sentence-transformers openai feedparser requests beautifulsoup4 plotly
+
+使用:
+streamlit run streamlit_rag_app.py
+"""
+
+import streamlit as st
+import ollama
+from openai import OpenAI
+import os
+from datetime import datetime
+import json
+import feedparser
+from bs4 import BeautifulSoup
+import plotly.express as px
+import plotly.graph_objects as go
+
+# RAG 相關
+import chromadb
+from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
+
+# 頁面配置
+st.set_page_config(
+    page_title="RAG + Ollama 新聞分析",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ============ RAG 系統類別 ============
+
+class NewsRAGSystem:
+    """新聞 RAG 系統"""
+    
+    def __init__(self, model_name="llama3.2", collection_name="news_collection"):
+        self.model_name = model_name
+        self.collection_name = collection_name
+        
+        # 初始化 Embedding 模型
+        if 'embedding_model' not in st.session_state:
+            with st.spinner("載入 Embedding 模型..."):
+                st.session_state.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.embedding_model = st.session_state.embedding_model
+        
+        # 初始化 ChromaDB
+        if 'chroma_client' not in st.session_state:
+            st.session_state.chroma_client = chromadb.Client(Settings(
+                persist_directory="./chroma_db",
+                anonymized_telemetry=False
+            ))
+        self.chroma_client = st.session_state.chroma_client
+        
+        # 獲取或創建集合
+        try:
+            self.collection = self.chroma_client.get_collection(collection_name)
+        except:
+            self.collection = self.chroma_client.create_collection(
+                name=collection_name,
+                metadata={"description": "新聞文章向量存儲"}
+            )
+    
+    def add_news(self, news_list):
+        """添加新聞到向量資料庫"""
+        if not news_list:
+            return
+        
+        documents = []
+        metadatas = []
+        ids = []
+        
+        for idx, news in enumerate(news_list):
+            text = f"{news['title']}\n{news.get('summary', '')}"
+            documents.append(text)
+            
+            metadatas.append({
+                "title": news['title'],
+                "source": news['source'],
+                "link": news.get('link', ''),
+                "published": news.get('published', ''),
+                "category": news.get('category', '')
+            })
+            
+            ids.append(f"news_{datetime.now().timestamp()}_{idx}")
+        
+        embeddings = self.embedding_model.encode(documents).tolist()
+        
+        self.collection.add(
+            documents=documents,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            ids=ids
+        )
+        
+        return len(news_list)
+    
+    def search_similar_news(self, query, n_results=5):
+        """搜尋相似新聞"""
+        query_embedding = self.embedding_model.encode([query]).tolist()
+        
+        results = self.collection.query(
+            query_embeddings=query_embedding,
+            n_results=n_results
+        )
+        
+        similar_news = []
+        for i in range(len(results['documents'][0])):
+            similar_news.append({
+                "content": results['documents'][0][i],
+                "metadata": results['metadatas'][0][i],
+                "distance": results['distances'][0][i] if 'distances' in results else None
+            })
+        
+        return similar_news
+    
+    def query_with_rag(self, question, n_context=3):
+        """使用 RAG 回答問題"""
+        similar_news = self.search_similar_news(question, n_results=n_context)
+        
+        context = "\n\n".join([
+            f"【新聞 {i+1}】\n來源: {news['metadata']['source']}\n內容: {news['content']}"
+            for i, news in enumerate(similar_news)
+        ])
+        
+        prompt = f"""基於以下新聞內容回答問題。
+
+相關新聞:
+{context}
+
+問題: {question}
+
+請基於上述新聞內容提供準確、客觀的回答。如果新聞中沒有相關資訊，請明確說明。"""
+
+        response = ollama.chat(
+            model=self.model_name,
+            messages=[{
+                'role': 'user',
+                'content': prompt
+            }]
+        )
+        
+        return response['message']['content'], similar_news
+    
+    def get_statistics(self):
+        """獲取統計"""
+        try:
+            return {
+                "total_news": self.collection.count(),
+                "collection_name": self.collection_name,
+                "model": self.model_name
+            }
+        except:
+            return {"total_news": 0}
+
+# ============ 工具函數 ============
+
+NEWS_SOURCES = {
+    "liberty_times": {
+        "name": "自由時報",
+        "rss": "https://news.ltn.com.tw/rss/all.xml",
+        "category": "綜合"
+    },
+    "taipei_times": {
+        "name": "Taipei Times",
+        "rss": "https://www.taipeitimes.com/xml/index.rss",
+        "category": "英文新聞"
+    }
+}
+
+def fetch_rss_news(source_key=None, limit=10):
+    """抓取 RSS 新聞"""
+    news_list = []
+    sources = {source_key: NEWS_SOURCES[source_key]} if source_key else NEWS_SOURCES
+    
+    for key, source in sources.items():
+        try:
+            feed = feedparser.parse(source['rss'])
+            for entry in feed.entries[:limit]:
+                news_item = {
+                    "source": source['name'],
+                    "title": entry.get('title', 'No title'),
+                    "link": entry.get('link', ''),
+                    "published": entry.get('published', ''),
+                    "summary": entry.get('summary', '')[:200] + "..." if entry.get('summary') else '',
+                    "category": source['category']
+                }
+                news_list.append(news_item)
+        except:
+            pass
+    
+    return news_list
+
+def check_ollama_status():
+    """檢查 Ollama 狀態"""
+    try:
+        ollama.list()
+        return True
+    except:
+        return False
+
+def list_ollama_models():
+    """列出可用模型"""
+    try:
+        models = ollama.list()
+        return [model['name'] for model in models['models']]
+    except:
+        return []
+
+# ============ Session State 初始化 ============
+
+if 'rag_system' not in st.session_state:
+    st.session_state.rag_system = None
+if 'ollama_model' not in st.session_state:
+    st.session_state.ollama_model = 'llama3.2'
+if 'use_ollama' not in st.session_state:
+    st.session_state.use_ollama = True
+if 'search_results' not in st.session_state:
+    st.session_state.search_results = []
+
+# ============ 側邊欄 ============
+
+with st.sidebar:
+    st.title("🤖 RAG + Ollama")
+    st.markdown("---")
+    
+    # Ollama 狀態檢查
+    st.subheader("📡 Ollama 狀態")
+    
+    if check_ollama_status():
+        st.success("✅ Ollama 運行中")
+        
+        # 模型選擇
+        available_models = list_ollama_models()
+        if available_models:
+            model_options = [m.split(':')[0] for m in available_models]
+            selected_model = st.selectbox(
+                "選擇模型",
+                model_options,
+                index=0 if st.session_state.ollama_model not in model_options else model_options.index(st.session_state.ollama_model)
+            )
+            st.session_state.ollama_model = selected_model
+            
+            st.info(f"🎯 當前模型: **{selected_model}**")
+        else:
+            st.warning("⚠️ 未找到已安裝的模型")
+            st.code("ollama pull llama3.2", language="bash")
+        
+        st.session_state.use_ollama = True
+        
+    else:
+        st.error("❌ Ollama 未運行")
+        st.markdown("""
+        **安裝 Ollama:**
+        - [下載 Ollama](https://ollama.com/download)
+        
+        **啟動服務:**
+        ```bash
+        ollama serve
+        ```
+        
+        **下載模型:**
+        ```bash
+        ollama pull llama3.2
+        ```
+        """)
+        st.session_state.use_ollama = False
+    
+    st.markdown("---")
+    
+    # RAG 系統初始化
+    st.subheader("🗄️ RAG 知識庫")
+    
+    if st.button("🚀 初始化 RAG 系統", use_container_width=True):
+        with st.spinner("初始化中..."):
+            try:
+                st.session_state.rag_system = NewsRAGSystem(
+                    model_name=st.session_state.ollama_model
+                )
+                st.success("✅ RAG 系統初始化完成")
+            except Exception as e:
+                st.error(f"❌ 初始化失敗: {e}")
+    
+    # 統計資訊
+    if st.session_state.rag_system:
+        stats = st.session_state.rag_system.get_statistics()
+        st.metric("知識庫新聞數", stats['total_news'])
+        st.metric("向量集合", stats['collection_name'])
+    
+    st.markdown("---")
+    
+    # 模型比較
+    with st.expander("📊 模型特性"):
+        st.markdown("""
+        **llama3.2**
+        - 速度: ⚡⚡⚡
+        - 品質: ⭐⭐⭐
+        - 適合: 通用任務
+        
+        **mistral**
+        - 速度: ⚡⚡
+        - 品質: ⭐⭐⭐⭐
+        - 適合: 複雜分析
+        
+        **qwen2.5**
+        - 速度: ⚡⚡⚡
+        - 品質: ⭐⭐⭐⭐
+        - 適合: 中文處理
+        """)
+
+# ============ 主要內容 ============
+
+st.title("🤖 RAG + Ollama 新聞分析服務")
+st.markdown("### 本地 LLM + 向量檢索增強生成")
+
+# 檢查系統狀態
+if not st.session_state.use_ollama:
+    st.warning("⚠️ Ollama 未運行，請先啟動 Ollama 服務")
+    st.stop()
+
+if not st.session_state.rag_system:
+    st.info("💡 請先在側邊欄初始化 RAG 系統")
+    st.stop()
+
+# 標籤頁
+tab1, tab2, tab3, tab4 = st.tabs(["🔍 搜尋與收集", "🤖 RAG 問答", "📊 新聞分析", "📈 知識庫管理"])
+
+# ============ Tab 1: 搜尋與收集 ============
+with tab1:
+    st.header("🔍 搜尋新聞並添加到知識庫")
+    
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        search_keyword = st.text_input("搜尋關鍵字", placeholder="例如: 人工智慧")
+    with col2:
+        search_limit = st.number_input("數量", min_value=1, max_value=50, value=10)
+    
+    if st.button("🔍 搜尋新聞", use_container_width=True, type="primary"):
+        with st.spinner("正在搜尋新聞..."):
+            results = fetch_rss_news(limit=search_limit)
+            st.session_state.search_results = results
+            
+            if results:
+                st.success(f"✅ 找到 {len(results)} 則新聞")
+            else:
+                st.warning("⚠️ 未找到新聞")
+    
+    # 顯示結果
+    if st.session_state.search_results:
+        st.markdown("---")
+        st.subheader(f"📋 搜尋結果 ({len(st.session_state.search_results)} 則)")
+        
+        # 批次添加
+        if st.button("📥 將所有新聞添加到知識庫", use_container_width=True):
+            with st.spinner("正在添加..."):
+                count = st.session_state.rag_system.add_news(st.session_state.search_results)
+                st.success(f"✅ 已添加 {count} 則新聞到知識庫")
+                st.rerun()
+        
+        st.markdown("---")
+        
+        # 顯示新聞
+        for idx, news in enumerate(st.session_state.search_results):
+            with st.expander(f"📰 {news['title']}", expanded=idx<3):
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    st.markdown(f"**來源:** {news['source']} | **分類:** {news['category']}")
+                    st.markdown(f"**發布:** {news['published']}")
+                    st.markdown(news['summary'])
+                    st.markdown(f"[🔗 閱讀全文]({news['link']})")
+                
+                with col2:
+                    if st.button("➕ 添加", key=f"add_{idx}", use_container_width=True):
+                        st.session_state.rag_system.add_news([news])
+                        st.success("✅ 已添加")
+                        st.rerun()
+
+# ============ Tab 2: RAG 問答 ============
+with tab2:
+    st.header("🤖 RAG 智能問答")
+    st.markdown("基於新聞知識庫的智能問答系統")
+    
+    # 問答介面
+    question = st.text_area(
+        "輸入您的問題",
+        placeholder="例如：最近台灣有什麼重要的科技新聞？",
+        height=100
+    )
+    
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        context_num = st.slider("參考新聞數量", min_value=1, max_value=10, value=3)
+    with col2:
+        if st.button("🚀 提問", use_container_width=True, type="primary"):
+            if question:
+                with st.spinner(f"🤖 {st.session_state.ollama_model} 思考中..."):
+                    try:
+                        answer, sources = st.session_state.rag_system.query_with_rag(
+                            question,
+                            n_context=context_num
+                        )
+                        
+                        st.markdown("---")
+                        st.subheader("💡 回答")
+                        st.markdown(answer)
+                        
+                        st.markdown("---")
+                        st.subheader("📚 參考來源")
+                        for i, source in enumerate(sources):
+                            with st.expander(f"來源 {i+1}: {source['metadata']['title']}", expanded=i==0):
+                                st.markdown(f"**來源:** {source['metadata']['source']}")
+                                st.markdown(f"**相關度:** {1 - source['distance']:.2%}")
+                                st.markdown(source['content'])
+                                
+                    except Exception as e:
+                        st.error(f"❌ 錯誤: {e}")
+            else:
+                st.warning("⚠️ 請輸入問題")
+    
+    # 預設問題
+    st.markdown("---")
+    st.subheader("💡 試試這些問題")
+    
+    sample_questions = [
+        "最近有哪些重要的科技新聞？",
+        "台灣的半導體產業有什麼新發展？",
+        "人工智慧技術的最新趨勢是什麼？",
+        "最近有哪些國際重要事件？"
+    ]
+    
+    cols = st.columns(2)
+    for idx, q in enumerate(sample_questions):
+        with cols[idx % 2]:
+            if st.button(q, key=f"sample_{idx}", use_container_width=True):
+                st.session_state.sample_question = q
+                st.rerun()
+
+# ============ Tab 3: 新聞分析 ============
+with tab3:
+    st.header("📊 新聞分析")
+    
+    news_text = st.text_area(
+        "新聞內容",
+        placeholder="貼上新聞內容...",
+        height=200
+    )
+    
+    analysis_type = st.selectbox(
+        "分析類型",
+        ["摘要", "關鍵字", "情緒", "5W1H"],
+        format_func=lambda x: {
+            "摘要": "📝 摘要生成",
+            "關鍵字": "🔑 關鍵字提取",
+            "情緒": "😊 情緒分析",
+            "5W1H": "📊 5W1H 分析"
+        }[x]
+    )
+    
+    if st.button("🚀 開始分析", use_container_width=True, type="primary"):
+        if news_text:
+            with st.spinner(f"🤖 使用 {st.session_state.ollama_model} 分析中..."):
+                try:
+                    prompts = {
+                        "摘要": "請用 2-3 句話摘要以下新聞：\n\n",
+                        "關鍵字": "請提取以下新聞的 5 個關鍵字（用逗號分隔）：\n\n",
+                        "情緒": "請分析以下新聞的情緒傾向（正面/中性/負面）並說明理由：\n\n",
+                        "5W1H": "請以 JSON 格式分析以下新聞的 5W1H（who, what, when, where, why, how）：\n\n"
+                    }
+                    
+                    prompt = prompts[analysis_type] + news_text
+                    
+                    response = ollama.chat(
+                        model=st.session_state.ollama_model,
+                        messages=[{
+                            'role': 'user',
+                            'content': prompt
+                        }]
+                    )
+                    
+                    result = response['message']['content']
+                    
+                    st.markdown("---")
+                    st.subheader("📄 分析結果")
+                    st.markdown(result)
+                    
+                    # 下載按鈕
+                    st.download_button(
+                        "📥 下載結果",
+                        result,
+                        file_name=f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                        mime="text/plain"
+                    )
+                    
+                except Exception as e:
+                    st.error(f"❌ 分析失敗: {e}")
+        else:
+            st.warning("⚠️ 請輸入新聞內容")
+
+# ============ Tab 4: 知識庫管理 ============
+with tab4:
+    st.header("📈 知識庫管理")
+    
+    if st.session_state.rag_system:
+        stats = st.session_state.rag_system.get_statistics()
+        
+        # 統計卡片
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("📰 總新聞數", stats['total_news'])
+        with col2:
+            st.metric("🤖 使用模型", stats['model'])
+        with col3:
+            st.metric("🗄️ 集合名稱", stats['collection_name'])
+        
+        st.markdown("---")
+        
+        # 向量搜尋測試
+        st.subheader("🔍 向量搜尋測試")
+        test_query = st.text_input("測試查詢", placeholder="輸入關鍵字測試向量搜尋")
+        
+        if st.button("搜尋", use_container_width=True):
+            if test_query:
+                with st.spinner("搜尋中..."):
+                    results = st.session_state.rag_system.search_similar_news(test_query, n_results=5)
+                    
+                    st.success(f"找到 {len(results)} 則相似新聞")
+                    
+                    for i, news in enumerate(results):
+                        with st.expander(f"#{i+1} {news['metadata']['title']} (相似度: {1-news['distance']:.2%})"):
+                            st.markdown(f"**來源:** {news['metadata']['source']}")
+                            st.markdown(news['content'])
+        
+        st.markdown("---")
+        
+        # 清空知識庫
+        st.subheader("⚠️ 危險操作")
+        if st.button("🗑️ 清空知識庫", type="secondary"):
+            if st.checkbox("我確定要清空知識庫"):
+                try:
+                    st.session_state.chroma_client.delete_collection(stats['collection_name'])
+                    st.session_state.rag_system = None
+                    st.success("✅ 知識庫已清空")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 清空失敗: {e}")
+
+# ============ 頁尾 ============
+st.markdown("---")
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.markdown("🤖 **Powered by Ollama**")
+with col2:
+    st.markdown("🗄️ **Vector DB: ChromaDB**")
+with col3:
+    st.markdown("📊 **Embedding: all-MiniLM-L6-v2**")
